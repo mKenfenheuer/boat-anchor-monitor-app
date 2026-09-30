@@ -1,0 +1,204 @@
+name: Issue triage
+
+on:
+  issues:
+    types: [opened, edited, reopened, labeled]
+  issue_comment:
+    types: [created, edited]
+  schedule:
+    - cron: '17 6 * * *'   # daily sweep for stale issues
+  workflow_dispatch:
+    inputs:
+      all_open:
+        description: 'Check all open issues now'
+        type: boolean
+        default: false
+      issue:
+        description: 'Or: check a single issue number (optional)'
+        required: false
+
+permissions:
+  issues: write
+
+concurrency:
+  group: issue-triage-${{ github.event.issue.number || 'sweep' }}
+  cancel-in-progress: false
+
+env:
+  OWNER_LOGIN: mKenfenheuer
+  NEEDS_LABEL: needs-diagnostics
+  # Issues with any of these labels never require diagnostics
+  EXEMPT_LABELS: enhancement,feature request,question,documentation,no-diagnostics-needed
+  CLOSE_AFTER_DAYS: '28'
+
+jobs:
+  assign:
+    if: github.event_name == 'issues' && github.event.action == 'opened'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Auto-assign issue
+        uses: pozil/auto-assign-issue@v4
+        with:
+          assignees: ${{ env.OWNER_LOGIN }}
+          abortIfPreviousAssignees: true
+
+  diagnostics:
+    # issue_comment also fires for PRs -> ignore those
+    if: github.event_name != 'issue_comment' || !github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for diagnostics
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const NEEDS = process.env.NEEDS_LABEL;
+            const EXEMPT = process.env.EXEMPT_LABELS.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+            const EXEMPT_AUTHORS = [process.env.OWNER_LOGIN.toLowerCase()];   // your own issues are never checked
+            const DAYS = Number(process.env.CLOSE_AFTER_DAYS);
+            const BOT = 'github-actions[bot]';
+            const MARKER = '<!-- diagnostics-bot -->';
+
+            // ---- What counts as "diagnostics attached" ----
+            // 1) An uploaded file (drag & drop into the issue/comment)
+            const FILE_PATTERNS = [
+              /https:\/\/github\.com\/user-attachments\/files\/\d+\//i,        // file upload (current format)
+              /https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/files\/\d+\//i,        // file upload (legacy format)
+              /\[[^\]]+\.(zip|log|txt|json|gz|tgz|tar|7z|diag)\]\(/i,          // linked log-like file
+            ];
+
+            // 2) The pasted diagnostics dump the app generates, e.g.
+            //    Aprox 4.0.7 (1)
+            //    Platform: iOS — Version 26.6.1 (Build 23G83)
+            //    Generated: 3. Sept. 2026, 16:39:14
+            //    2026-09-03T15:38:55.305Z  [storekit] INFO   Entitlement resolved ...
+            const HEADER    = /^\s*Aprox\s+\d+(\.\d+){1,3}\s*\(\d+\)\s*$/im;   // app name + version (build)
+            const PLATFORM  = /^\s*Platform:\s*\S+.*\d/im;                      // platform + OS version
+            const GENERATED = /^\s*Generated:\s*\S.*\d/im;                      // timestamp of the dump
+            const LOG_LINE  = /^\s*\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z\s+\[[\w.-]+\]\s+[A-Z]{3,}\s+\S/gm;
+
+            function looksLikeDiagnostics(text) {
+              if (!text) return false;
+              if (FILE_PATTERNS.some(p => p.test(text))) return true;
+
+              const logLines = (text.match(LOG_LINE) || []).length;
+              const hasMeta = HEADER.test(text) && PLATFORM.test(text) && GENERATED.test(text);
+
+              // Full dump (version + platform + generated + at least one log line),
+              // or at least a few real log lines if someone only pasted part of it
+              return (hasMeta && logLines >= 1) || logLines >= 3;
+            }
+
+            const request = author => `${MARKER}
+            Hi @${author}, thanks for the report! 👋
+
+            To look into this I need the app's diagnostics. Please:
+
+            1. Open the app and go to **Settings**
+            2. Scroll all the way down and tap **Collect diagnostics**
+            3. **Share** the file and upload it here (drag & drop it into a comment), **or** create the issue directly from there in the app
+
+            ⏳ If no diagnostics are attached within **4 weeks**, this issue will be closed automatically. You can still add them afterwards and it will be reopened.`.replace(/^ {12}/gm, '');
+
+            const RECEIVED = `${MARKER}\n✅ Diagnostics received, thanks! I'll take a look.`;
+
+            const CLOSING = `No diagnostics were attached within 4 weeks, so I'm closing this issue for now.
+
+            If the problem still occurs, go to **Settings** → scroll down → **Collect diagnostics**, then share the file and upload it here. The issue will be reopened automatically.`.replace(/^ {12}/gm, '');
+
+            const labelsOf = issue => issue.labels.map(l => (typeof l === 'string' ? l : l.name).toLowerCase());
+
+            async function evaluate(issue) {
+              const comments = await github.paginate(github.rest.issues.listComments,
+                { owner, repo, issue_number: issue.number, per_page: 100 });
+              const botComment = comments.find(c => c.user?.login === BOT && c.body?.includes(MARKER));
+              const texts = [issue.body, ...comments.filter(c => c.user?.login !== BOT).map(c => c.body)];
+              const found = texts.some(looksLikeDiagnostics);
+              return { found, botComment };
+            }
+
+            async function handleIssue(number) {
+              const { data: issue } = await github.rest.issues.get({ owner, repo, issue_number: number });
+              if (issue.pull_request) return;
+
+              const labels = labelsOf(issue);
+              const exempt = EXEMPT_AUTHORS.includes(issue.user.login.toLowerCase())
+                          || labels.some(l => EXEMPT.includes(l));
+              const flagged = labels.includes(NEEDS.toLowerCase());
+              const { found, botComment } = await evaluate(issue);
+
+              core.info(`#${number} by ${issue.user.login} | event=${context.eventName}/${context.payload.action} | state=${issue.state} | labels=[${labels}] | exempt=${exempt} | flagged=${flagged} | diagnostics=${found} | botComment=${!!botComment}`);
+
+              if (found || exempt) {
+                if (!flagged) return;
+                await github.rest.issues.removeLabel({ owner, repo, issue_number: number, name: NEEDS }).catch(() => {});
+                if (found && botComment) {
+                  await github.rest.issues.updateComment({ owner, repo, comment_id: botComment.id, body: RECEIVED });
+                }
+                // Reopen issues this workflow closed once diagnostics show up
+                if (found && issue.state === 'closed' && issue.state_reason === 'not_planned') {
+                  await github.rest.issues.update({ owner, repo, issue_number: number, state: 'open' });
+                }
+                return;
+              }
+
+              if (issue.state === 'closed') return;
+
+              if (flagged && context.payload.action === 'reopened') {
+                // Manually reopened without diagnostics: restart the 4-week timer
+                await github.rest.issues.removeLabel({ owner, repo, issue_number: number, name: NEEDS }).catch(() => {});
+                await github.rest.issues.addLabels({ owner, repo, issue_number: number, labels: [NEEDS] });
+              } else if (!flagged) {
+                await github.rest.issues.addLabels({ owner, repo, issue_number: number, labels: [NEEDS] });
+              }
+
+              if (!botComment) {
+                await github.rest.issues.createComment({ owner, repo, issue_number: number, body: request(issue.user.login) });
+              }
+            }
+
+            async function sweep() {
+              const cutoff = Date.now() - DAYS * 24 * 60 * 60 * 1000;
+              const issues = await github.paginate(github.rest.issues.listForRepo,
+                { owner, repo, state: 'open', labels: NEEDS, per_page: 100 });
+
+              core.info(`Sweep: ${issues.length} open issue(s) labeled '${NEEDS}'`);
+
+              for (const issue of issues) {
+                if (issue.pull_request) continue;
+
+                const events = await github.paginate(github.rest.issues.listEvents,
+                  { owner, repo, issue_number: issue.number, per_page: 100 });
+                const labeledAt = events
+                  .filter(e => e.event === 'labeled' && e.label?.name === NEEDS)
+                  .map(e => Date.parse(e.created_at))
+                  .pop() ?? Date.parse(issue.created_at);
+
+                if (labeledAt > cutoff) { core.info(`#${issue.number}: flagged ${new Date(labeledAt).toISOString()}, not due yet`); continue; }
+
+                const { found } = await evaluate(issue);
+                const exempt = labelsOf(issue).some(l => EXEMPT.includes(l));
+                if (found || exempt) { await handleIssue(issue.number); continue; }
+
+                core.info(`Closing #${issue.number}: no diagnostics for ${DAYS} days`);
+                await github.rest.issues.createComment({ owner, repo, issue_number: issue.number, body: CLOSING });
+                await github.rest.issues.update({ owner, repo, issue_number: issue.number, state: 'closed', state_reason: 'not_planned' });
+              }
+            }
+
+            async function checkAllOpen() {
+              const issues = await github.paginate(github.rest.issues.listForRepo,
+                { owner, repo, state: 'open', per_page: 100 });
+              const real = issues.filter(i => !i.pull_request);
+              core.info(`Checking all ${real.length} open issue(s)`);
+              for (const i of real) await handleIssue(i.number);
+            }
+
+            if (context.eventName === 'schedule' || context.eventName === 'workflow_dispatch') {
+              const inputs = context.payload.inputs ?? {};
+              if (inputs.all_open === true || inputs.all_open === 'true') await checkAllOpen();
+              else if (inputs.issue) await handleIssue(Number(inputs.issue));
+              await sweep();
+            } else {
+              await handleIssue(context.payload.issue.number);
+            }
